@@ -222,6 +222,7 @@ typedef struct sentinelRedisInstance {
      * are set to NULL no script is executed. */
     char *notification_script;
     char *client_reconfig_script;
+    char *failover_guard_script;
     sds info; /* cached INFO output */
 } sentinelRedisInstance;
 
@@ -244,6 +245,7 @@ struct sentinelState {
     unsigned long simfailure_flags; /* Failures simulation. */
     int deny_scripts_reconfig; /* Allow SENTINEL SET ... to change script
                                   paths at runtime? */
+    sds failover_guard_script;   /* Path to failover guard script */
 } sentinel;
 
 /* A script execution job. */
@@ -1224,6 +1226,7 @@ sentinelRedisInstance *createSentinelRedisInstance(char *name, int flags, char *
     ri->promoted_slave = NULL;
     ri->notification_script = NULL;
     ri->client_reconfig_script = NULL;
+    ri->failover_guard_script = NULL;
     ri->info = NULL;
 
     /* Role */
@@ -1253,6 +1256,7 @@ void releaseSentinelRedisInstance(sentinelRedisInstance *ri) {
     sdsfree(ri->runid);
     sdsfree(ri->notification_script);
     sdsfree(ri->client_reconfig_script);
+    sdsfree(ri->failover_guard_script);
     sdsfree(ri->slave_master_host);
     sdsfree(ri->leader);
     sdsfree(ri->auth_pass);
@@ -1625,6 +1629,13 @@ char *sentinelHandleConfiguration(char **argv, int argc) {
             return "Client reconfiguration script seems non existing or "
                    "non executable.";
         ri->client_reconfig_script = sdsnew(argv[2]);
+   } else if (!strcasecmp(argv[0],"failover-guard-script") && argc == 3) {
+        ri = sentinelGetMasterByName(argv[1]);
+        if (!ri) return "No such master with specified name.";
+        if (access(argv[2],X_OK) == -1)
+            return "failover-guard-script seems non existing or "
+                   "non executable.";
+        ri->failover_guard_script = sdsnew(argv[2]);
    } else if (!strcasecmp(argv[0],"auth-pass") && argc == 3) {
         /* auth-pass <name> <password> */
         ri = sentinelGetMasterByName(argv[1]);
@@ -1771,6 +1782,14 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state) {
             line = sdscatprintf(sdsempty(),
                 "sentinel client-reconfig-script %s %s",
                 master->name, master->client_reconfig_script);
+            rewriteConfigRewriteLine(state,"sentinel",line,1);
+        }
+
+        /* sentinel failover-guard-script */
+        if (master->failover_guard_script) {
+            line = sdscatprintf(sdsempty(),
+                "sentinel failover-guard-script %s %s",
+                master->name, master->failover_guard_script);
             rewriteConfigRewriteLine(state,"sentinel",line,1);
         }
 
@@ -2788,6 +2807,12 @@ void addReplySentinelRedisInstance(client *c, sentinelRedisInstance *ri) {
             addReplyBulkCString(c,ri->client_reconfig_script);
             fields++;
         }
+
+        if (ri->failover_guard_script) {
+            addReplyBulkCString(c,"failover-guard-script");
+            addReplyBulkCString(c,ri->failover_guard_script);
+            fields++;
+        }
     }
 
     /* Only slaves */
@@ -3379,6 +3404,18 @@ void sentinelSetCommand(client *c) {
             }
             sdsfree(ri->client_reconfig_script);
             ri->client_reconfig_script = strlen(value) ? sdsnew(value) : NULL;
+            changes++;
+       } else if (!strcasecmp(option,"failover-guard-script")) {
+            /* failover-guard-script <path> */
+            if (strlen(value) && access(value,X_OK) == -1) {
+                addReplyError(c,
+                    "failover-guard-script seems non existing or "
+                    "non executable");
+                if (changes) sentinelFlushConfig();
+                return;
+            }
+            sdsfree(ri->failover_guard_script);
+            ri->failover_guard_script = strlen(value) ? sdsnew(value) : NULL;
             changes++;
        } else if (!strcasecmp(option,"auth-pass")) {
             /* auth-pass <password> */
@@ -4020,12 +4057,36 @@ void sentinelFailoverWaitStart(sentinelRedisInstance *ri) {
 void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
     sentinelRedisInstance *slave = sentinelSelectSlave(ri);
 
+    ri->promoted_slave = slave;
     /* We don't handle the timeout in this state as the function aborts
      * the failover or go forward in the next state. */
     if (slave == NULL) {
         sentinelEvent(LL_WARNING,"-failover-abort-no-good-slave",ri,"%@");
         sentinelAbortFailover(ri);
     } else {
+	/* === Custom whitelist check after promoted slave selected === */
+        if (ri->failover_guard_script && slave) {
+          char cmd[512];
+          snprintf(cmd, sizeof(cmd),
+              "%s %s %d %s %s %d %s %d",
+              ri->failover_guard_script,
+              ri->name,
+              SENTINEL_LEADER,
+              "start",
+              ri->addr->ip,
+              ri->addr->port,
+              slave->addr->ip,
+              slave->addr->port
+          );
+          int rc = system(cmd);
+          if (rc != 0) {
+              sentinelEvent(LL_WARNING, "+failover-blocked", ri,
+                  "Failover blocked by whitelist check (promoted slave not allowed)");
+              ri->promoted_slave = NULL;
+              sentinelAbortFailover(ri);
+              return;
+          }
+        }
         sentinelEvent(LL_WARNING,"+selected-slave",slave,"%@");
         slave->flags |= SRI_PROMOTED;
         ri->promoted_slave = slave;
