@@ -245,7 +245,6 @@ struct sentinelState {
     unsigned long simfailure_flags; /* Failures simulation. */
     int deny_scripts_reconfig; /* Allow SENTINEL SET ... to change script
                                   paths at runtime? */
-    sds failover_guard_script;   /* Path to failover guard script */
 } sentinel;
 
 /* A script execution job. */
@@ -4056,18 +4055,17 @@ void sentinelFailoverWaitStart(sentinelRedisInstance *ri) {
 
 void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
     sentinelRedisInstance *slave = sentinelSelectSlave(ri);
-    ri->promoted_slave = slave;
     /* We don't handle the timeout in this state as the function aborts
      * the failover or go forward in the next state. */
     if (slave == NULL) {
         sentinelEvent(LL_WARNING,"-failover-abort-no-good-slave",ri,"%@");
         sentinelAbortFailover(ri);
     } else {
-	/* === Custom whitelist check after promoted slave selected === */
-        if (ri->failover_guard_script && slave) {
+        /* === Custom whitelist check after promoted slave selected === */
+        if (ri->failover_guard_script) {
             char cmd[512];
             snprintf(cmd, sizeof(cmd),
-                "%s %s %d %s %s %d %s %d",
+                "\"%s\" \"%s\" %d \"%s\" \"%s\" %d \"%s\" %d",
                 ri->failover_guard_script,
                 ri->name,
                 SENTINEL_LEADER,
@@ -4077,9 +4075,13 @@ void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
                 slave->addr->ip,
                 slave->addr->port
             );
+
             int rc = system(cmd);
+            if (WIFEXITED(rc))
+                rc = WEXITSTATUS(rc);
+
             if (rc != 0) {
-                sentinelEvent(LL_WARNING, "+failover-blocked", ri,
+                sentinelEvent(LL_WARNING, "-failover-blocked", ri,
                     "Failover blocked by whitelist check (promoted slave not allowed)");
                 ri->promoted_slave = NULL;
                 sentinelAbortFailover(ri);
