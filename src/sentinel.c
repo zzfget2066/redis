@@ -4056,7 +4056,6 @@ void sentinelFailoverWaitStart(sentinelRedisInstance *ri) {
 
 void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
     sentinelRedisInstance *slave = sentinelSelectSlave(ri);
-
     ri->promoted_slave = slave;
     /* We don't handle the timeout in this state as the function aborts
      * the failover or go forward in the next state. */
@@ -4066,26 +4065,26 @@ void sentinelFailoverSelectSlave(sentinelRedisInstance *ri) {
     } else {
 	/* === Custom whitelist check after promoted slave selected === */
         if (ri->failover_guard_script && slave) {
-          char cmd[512];
-          snprintf(cmd, sizeof(cmd),
-              "%s %s %d %s %s %d %s %d",
-              ri->failover_guard_script,
-              ri->name,
-              SENTINEL_LEADER,
-              "start",
-              ri->addr->ip,
-              ri->addr->port,
-              slave->addr->ip,
-              slave->addr->port
-          );
-          int rc = system(cmd);
-          if (rc != 0) {
-              sentinelEvent(LL_WARNING, "+failover-blocked", ri,
-                  "Failover blocked by whitelist check (promoted slave not allowed)");
-              ri->promoted_slave = NULL;
-              sentinelAbortFailover(ri);
-              return;
-          }
+            char cmd[512];
+            snprintf(cmd, sizeof(cmd),
+                "%s %s %d %s %s %d %s %d",
+                ri->failover_guard_script,
+                ri->name,
+                SENTINEL_LEADER,
+                "start",
+                ri->addr->ip,
+                ri->addr->port,
+                slave->addr->ip,
+                slave->addr->port
+            );
+            int rc = system(cmd);
+            if (rc != 0) {
+                sentinelEvent(LL_WARNING, "+failover-blocked", ri,
+                    "Failover blocked by whitelist check (promoted slave not allowed)");
+                ri->promoted_slave = NULL;
+                sentinelAbortFailover(ri);
+                return;
+            }
         }
         sentinelEvent(LL_WARNING,"+selected-slave",slave,"%@");
         slave->flags |= SRI_PROMOTED;
